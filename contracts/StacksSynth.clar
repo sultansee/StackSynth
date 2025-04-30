@@ -161,3 +161,123 @@
             error ERR-ARITHMETIC-OVERFLOW)
         error ERR-ARITHMETIC-OVERFLOW))
 )
+
+(define-public (burn-synthetic-tokens (token-amount uint))
+    (let (
+        (vault-details (unwrap! (get-user-vault-details tx-sender) 
+                               ERR-NO-VAULT-EXISTS))
+        (user-balance (get-synthetic-token-balance tx-sender))
+    )
+    (asserts! (> token-amount u0) ERR-ZERO-AMOUNT)
+    (asserts! (>= user-balance token-amount) ERR-INSUFFICIENT-TOKEN-BALANCE)
+    (asserts! (>= (get minted-synthetic-tokens vault-details) token-amount) 
+              ERR-UNAUTHORIZED-ACCESS)
+
+    (match (safe-multiply (get deposited-collateral-amount vault-details) token-amount)
+        collateral-calc
+        (let (
+            (collateral-return-amount (/ collateral-calc 
+                                       (get minted-synthetic-tokens vault-details)))
+        )
+
+        (try! (as-contract (stx-transfer? collateral-return-amount
+                                         (as-contract tx-sender)
+                                         tx-sender)))
+
+        (match (safe-subtract (get deposited-collateral-amount vault-details) 
+                            collateral-return-amount)
+            new-collateral-amount
+            (match (safe-subtract (get minted-synthetic-tokens vault-details) 
+                                token-amount)
+                new-minted-amount
+                (begin
+                    (map-set user-collateral-vault tx-sender
+                        {
+                            deposited-collateral-amount: new-collateral-amount,
+                            minted-synthetic-tokens: new-minted-amount,
+                            collateral-locked-at-price: (var-get oracle-current-asset-price)
+                        })
+
+                    (match (safe-subtract user-balance token-amount)
+                        new-balance
+                        (begin
+                            (map-set synthetic-token-holder-balances tx-sender new-balance)
+                            (match (safe-subtract (var-get synthetic-token-total-supply) 
+                                                token-amount)
+                                new-supply
+                                (begin
+                                    (var-set synthetic-token-total-supply new-supply)
+                                    (ok true))
+                                error ERR-ARITHMETIC-OVERFLOW))
+                        error ERR-ARITHMETIC-OVERFLOW))
+                error ERR-ARITHMETIC-OVERFLOW)
+            error ERR-ARITHMETIC-OVERFLOW))
+        error ERR-ARITHMETIC-OVERFLOW))
+)
+
+(define-public (transfer-synthetic-tokens (recipient-address principal) (transfer-amount uint))
+    (begin
+        ;; Input validation
+        (asserts! (> transfer-amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (<= transfer-amount (get-synthetic-token-balance tx-sender)) ERR-INSUFFICIENT-TOKEN-BALANCE)
+        (asserts! (not (is-eq tx-sender recipient-address)) ERR-INVALID-RECIPIENT)
+
+        ;; Only proceed with transfer if validations pass
+        (process-token-transfer tx-sender recipient-address transfer-amount))
+)
+
+(define-public (deposit-additional-collateral (collateral-amount uint))
+    (let (
+        (vault-details (default-to 
+            {
+                deposited-collateral-amount: u0, 
+                minted-synthetic-tokens: u0, 
+                collateral-locked-at-price: u0
+            }
+            (get-user-vault-details tx-sender)))
+    )
+    (asserts! (> collateral-amount u0) ERR-ZERO-AMOUNT)
+    (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+
+    (match (safe-add (get deposited-collateral-amount vault-details) 
+                    collateral-amount)
+        new-collateral-amount
+        (begin
+            (map-set user-collateral-vault tx-sender
+                {
+                    deposited-collateral-amount: new-collateral-amount,
+                    minted-synthetic-tokens: (get minted-synthetic-tokens vault-details),
+                    collateral-locked-at-price: (var-get oracle-current-asset-price)
+                })
+            (ok true))
+        error ERR-ARITHMETIC-OVERFLOW))
+)
+
+(define-public (liquidate-undercollateralized-vault (vault-owner principal))
+    (let (
+        (vault-details (unwrap! (get-user-vault-details vault-owner) 
+                               ERR-NO-VAULT-EXISTS))
+        (current-collateral-ratio (unwrap! (calculate-vault-collateral-ratio vault-owner) 
+                                         ERR-UNAUTHORIZED-ACCESS))
+    )
+    (asserts! (< current-collateral-ratio LIQUIDATION-THRESHOLD-RATIO) 
+              ERR-UNAUTHORIZED-ACCESS)
+
+    ;; Transfer collateral to liquidator
+    (try! (as-contract (stx-transfer? (get deposited-collateral-amount vault-details)
+                                     (as-contract tx-sender)
+                                     tx-sender)))
+
+    ;; Clear the vault
+    (map-delete user-collateral-vault vault-owner)
+
+    ;; Burn the synthetic tokens
+    (map-set synthetic-token-holder-balances vault-owner u0)
+    (match (safe-subtract (var-get synthetic-token-total-supply) 
+                         (get minted-synthetic-tokens vault-details))
+        new-supply
+        (begin
+            (var-set synthetic-token-total-supply new-supply)
+            (ok true))
+        error ERR-ARITHMETIC-OVERFLOW))
+)
